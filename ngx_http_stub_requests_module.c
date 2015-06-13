@@ -15,10 +15,16 @@ static ngx_int_t ngx_http_stub_requests_show_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_stub_requests_log_handler(ngx_http_request_t *r);
 static void ngx_http_stub_requests_cleanup(void *data);
 static ngx_int_t ngx_http_stub_requests_init(ngx_conf_t *cf);
+static ngx_int_t ngx_http_stub_requests_init_process(ngx_cycle_t *cycle);
 
 
 static ngx_shm_zone_t *ngx_http_stub_requests_shm_zone;
 static ngx_http_stub_requests_entry_t* ngx_http_stub_requests_entries = NULL;
+
+#if (NGX_STAT_STUB)
+static ngx_atomic_int_t per_second;
+static ngx_atomic_int_t last_second;
+#endif
 
 static ngx_str_t header_html = ngx_string(
 "<!doctype html>\n"
@@ -54,6 +60,9 @@ static ngx_str_t header_html = ngx_string(
 "</script>\n"
 "</head>\n"
 "<body>\n"
+);
+
+static ngx_str_t middle_html = ngx_string(
 "<table>\n"
 "<thead>\n"
 "<tr>\n"
@@ -112,7 +121,7 @@ ngx_module_t  ngx_http_stub_requests_module = {
   NGX_HTTP_MODULE,                     /* module type */
   NULL,                                /* init master */
   NULL,                                /* init module */
-  NULL,                                /* init process */
+  ngx_http_stub_requests_init_process, /* init process */
   NULL,                                /* init thread */
   NULL,                                /* exit thread */
   NULL,                                /* exit process */
@@ -167,6 +176,40 @@ static ngx_int_t ngx_http_stub_requests_init(ngx_conf_t *cf) {
 }
 
 
+#if (NGX_STAT_STUB)
+static void ngx_http_stub_requests_second(ngx_event_t *ev) {
+  ngx_atomic_int_t a = *ngx_stat_accepted;
+  per_second = a - last_second;
+  last_second = a;
+
+  if ( ! (ngx_quit || ngx_terminate || ngx_exiting) ) {
+    ngx_add_timer(ev, 1000);
+  }
+}
+#endif
+
+
+static ngx_int_t ngx_http_stub_requests_init_process(ngx_cycle_t *cycle) {
+#if (NGX_STAT_STUB)
+  ngx_connection_t *dummy;
+  dummy = ngx_pcalloc(cycle->pool, sizeof(ngx_connection_t));
+  if (dummy == NULL) {
+    return NGX_ERROR;
+  }
+  dummy->fd = (ngx_socket_t) -1;
+  dummy->data = cycle;
+
+  ngx_event_t *ngx_http_stub_requests_timer = ngx_pcalloc(cycle->pool, sizeof(ngx_event_t));
+  ngx_http_stub_requests_timer->log = ngx_cycle->log;
+  ngx_http_stub_requests_timer->data = dummy;
+  ngx_http_stub_requests_timer->handler = ngx_http_stub_requests_second;
+  ngx_add_timer(ngx_http_stub_requests_timer, 0);
+#endif
+
+  return NGX_OK;
+}
+
+
 static ngx_msec_int_t ngx_http_stub_requests_duration(ngx_http_request_t *r) {
   ngx_msec_int_t ms;
   ngx_time_t     *tp = ngx_timeofday();
@@ -186,42 +229,53 @@ static ngx_chain_t *ngx_http_stub_requests_show(ngx_http_request_t *r, ngx_http_
 
   ngx_msec_int_t duration = ngx_http_stub_requests_duration(er);
 
-  // In theory someone can send a huge url and user-agent to max out this buffer.
-  // In that case the html of the page will be broken.
-  // The max size for a uri and user-agent is usualy 8k
-  // See: http://nginx.org/en/docs/http/ngx_http_core_module.html#large_client_header_buffers
-  u_char buffer[1024*8];
+  // Reserve 256 bytes for the html and duration strings.
+  size_t len = 256;
+  len += er->connection->addr_text.len;
+  len += er->method_name.len;
+  len += ngx_escape_html(0, er->uri.data, er->uri.len);
 
-#define header_param(name) (er->headers_in.name != NULL) ? &er->headers_in.name->value : &empty_str
+  // See: http://lxr.nginx.org/source/src/http/ngx_http_request.h#0175
+  if (er->headers_in.host != NULL) {
+    len += ngx_escape_html(0, er->headers_in.host->value.data, er->headers_in.host->value.len);
+  }
+  if (er->headers_in.user_agent != NULL) {
+    len += ngx_escape_html(0, er->headers_in.user_agent->value.data, er->headers_in.user_agent->value.len);
+  }
 
-  // See: http://lxr.nginx.org/source/src/core/ngx_string.c#0072
-  // And: http://lxr.nginx.org/source/src/http/ngx_http_request.h#0359
-  // And http://lxr.nginx.org/source/src/core/ngx_connection.h#0124
-  u_char *p = ngx_snprintf(buffer, sizeof(buffer), "<tr><td>%T.%03M sec</td><td>%V</td><td>%V</td><td>http%s://%V</td><td>%V</td><td>%V</td></tr>\n",
-    (time_t)duration / 1000, duration % 1000,
-    &er->connection->addr_text,
-    &er->method_name,
-    (er->connection->ssl != NULL) ? "s" : "",
-    &er->headers_in.host->value,
-    &er->uri,
-    // See: http://lxr.nginx.org/source/src/http/ngx_http_request.h#0175
-    header_param(user_agent)
-  );
-
-#undef header_param
-
-  size_t n = p - buffer;
-
-  c->next = NULL;
-  c->buf = ngx_create_temp_buf(r->pool, n);
+  c->buf = ngx_create_temp_buf(r->pool, len);
   if (c->buf == NULL) {
     return NULL;
   }
 
-  ngx_memcpy(c->buf->pos, buffer, n);
-  c->buf->last = c->buf->pos + n;
+  u_char *p = c->buf->pos;
 
+  // See: http://lxr.nginx.org/source/src/core/ngx_string.c#0072
+  // And: http://lxr.nginx.org/source/src/http/ngx_http_request.h#0359
+  // And http://lxr.nginx.org/source/src/core/ngx_connection.h#0124
+  p = ngx_sprintf(p, "<tr><td>%T.%03M sec</td><td>%V</td><td>%V</td><td>http%s://",
+    (time_t)duration / 1000, duration % 1000,
+    &er->connection->addr_text,
+    &er->method_name,
+    (er->connection->ssl != NULL) ? "s" : ""
+  );
+
+  if (er->headers_in.host != NULL) {
+    p = (u_char*)ngx_escape_html(p, er->headers_in.host->value.data, er->headers_in.host->value.len);
+  }
+  p = ngx_sprintf(p, "</td><td>");
+  p = (u_char*)ngx_escape_html(p, er->uri.data, er->uri.len);
+  p = ngx_sprintf(p, "</td><td>");
+
+  if (er->headers_in.user_agent != NULL) {
+    p = (u_char*)ngx_escape_html(p, er->headers_in.user_agent->value.data, er->headers_in.user_agent->value.len);
+  }
+
+  p = ngx_sprintf(p, "</td></td>\n");
+
+  c->buf->last = p;
   c->buf->memory = 1;
+  c->next = NULL;
 
   if (e->next != NULL) {
     c->next = ngx_http_stub_requests_show(r, e->next);
@@ -262,17 +316,47 @@ static ngx_int_t ngx_http_stub_requests_show_handler(ngx_http_request_t *r) {
     return NGX_ERROR;
   }
 
-  ngx_chain_t *last = table;
-  while (last->next != NULL) {
-    last = last->next;
-  }
-
   ngx_chain_t header;
-  header.next = table;
   header.buf = ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
   header.buf->pos = header_html.data;
   header.buf->last = header_html.data + header_html.len;
   header.buf->memory = 1;
+
+  ngx_chain_t *last = &header;
+
+#if (NGX_STAT_STUB)
+
+  size_t len = sizeof("Active connections:  <br>") + NGX_ATOMIC_T_LEN
+    + sizeof("Reading:  Writing:  Waiting:  <br>") + 3 * NGX_ATOMIC_T_LEN
+    + sizeof("Per second:  <br>") + NGX_ATOMIC_T_LEN;
+
+  ngx_chain_t stats;
+  header.next = &stats;
+  stats.buf = ngx_create_temp_buf(r->pool, len);
+  stats.buf->memory = 1;
+
+  stats.buf->last = ngx_sprintf(stats.buf->pos, "Active connections: %uA <br>\n", *ngx_stat_active);
+  stats.buf->last = ngx_sprintf(stats.buf->last, "Reading: %uA Writing: %uA Waiting: %uA <br>\n",
+    *ngx_stat_reading, *ngx_stat_writing, *ngx_stat_waiting
+  );
+  stats.buf->last = ngx_sprintf(stats.buf->last, "Per second: %uA <br>\n", per_second);
+
+  last = &stats;
+
+#endif
+
+  ngx_chain_t middle;
+  last->next = &middle;
+  middle.next = table;
+  middle.buf = ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
+  middle.buf->pos = middle_html.data;
+  middle.buf->last = middle_html.data + middle_html.len;
+  middle.buf->memory = 1;
+
+  last = table;
+  while (last->next != NULL) {
+    last = last->next;
+  }
 
   ngx_chain_t footer;
   last->next = &footer;
