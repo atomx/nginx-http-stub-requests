@@ -56,7 +56,20 @@ stub_requests
 :Context: location
 :Description:
   The basic request information will be accessible from the surrounding location.
-  
+
+stub_requests_shm_size
+~~~~~~~~~~~~~~~~~~~~
+:Syntax: ``stub_requests_shm_size`` *size-in-bytes*
+:Default: ``4096k``
+:Context: http
+:Description:
+  The module keeps information about requests in shared memory so each worker can
+  generate the requests page. The information includes the requested uri and the
+  user agent.
+
+  When the shared memory is full an error will be logged. This will not stop the
+  request from continuing normally.
+ 
 
 Testing
 ==========
