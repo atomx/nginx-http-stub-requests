@@ -14,27 +14,35 @@ Dependencies
 Building
 ========
 
-1. Unpack the nginx\_ sources::
+1. Download nginx::
 
-    $ tar zxvf nginx-1.x.x.tar.gz
+   $ wget http://nginx.org/download/nginx-1.9.2.tar.gz
 
-2. Unzip the sources for the digest module::
+2. Unpack the nginx sources::
 
-    $ unzip master.zip
+    $ tar xzf nginx-1.9.2.tar.gz
 
-3. Change to the directory which contains the nginx\_ sources, run the
+3. Download the module::
+
+   $ wget https://github.com/atomx/nginx-http-stub-requests/archive/v1.0.1.tar.gz
+
+4. Unpack the sources for the module::
+
+    $ tar xzf nginx-http-stub-requests-1.0.1.tar.gz
+
+5. Change to the directory which contains the nginx sources, run the
    configuration script with the desired options and be sure to put an
    ``--add-module`` flag pointing to the directory which contains the source
-   of the digest module::
+   of the module::
 
     $ cd nginx-1.x.x
-    $ ./configure --add-module=../nginx-http-stub-requests-master  [other configure options]
+    $ ./configure --add-module=../nginx-http-stub-requests-1.0.1  [other configure options]
 
-4. Build and install the software::
+6. Build and install the software::
 
     $ make && sudo make install
 
-5. Configure nginx using the module's configuration directives_.
+7. Configure nginx using the module's configuration directives_.
 
 
 Example
@@ -44,6 +52,11 @@ You can enable stub_requests by adding the following lines into
 a ``location`` section in your nginx configuration file::
 
   stub_requests;
+
+
+You can find an example here: http://dubbelboer.com/requests
+
+.. image:: https://github.com/atomx/nginx-http-stub-requests/blob/master/example.png
 
 
 Directives
@@ -76,7 +89,7 @@ Testing
 
 Make sure to compile nginx with the ngx_echo module: http://wiki.nginx.org/HttpEchoModule::
 
-    $ ./configure --add-module=../nginx-http-stub-requests-master --add-module=../echo-nginx-module  [other configure options]
+    $ ./configure --add-module=../nginx-http-stub-requests-1.0.1 --add-module=../echo-nginx-module  [other configure options]
 
 After that you can run the test against the nginx binary::
 
