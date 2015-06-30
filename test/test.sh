@@ -2,6 +2,7 @@
 
 $NGINX -p $PWD -c server.conf &
 sleep 1
+curl -s -S -H "Host: example.com" "http://127.0.0.1:9090/requests?enable=1" 2>&1 > /dev/null
 
 curl -s -S -H "Host: example.com" "http://127.0.0.1:9090/sleep" 2>&1 > /dev/null &
 sleep 0.5

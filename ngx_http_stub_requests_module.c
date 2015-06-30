@@ -32,8 +32,9 @@ static ngx_int_t  ngx_http_stub_requests_log_handler(ngx_http_request_t *r);
 static void       ngx_http_stub_requests_cleanup(void *data);
 
 
-static ngx_uint_t      ngx_http_stub_requests_shm_size;
-static ngx_shm_zone_t *ngx_http_stub_requests_shm_zone;
+static ngx_uint_t        ngx_http_stub_requests_shm_size;
+static ngx_shm_zone_t   *ngx_http_stub_requests_shm_zone;
+static ngx_atomic_int_t *ngx_http_stub_requests_enabled = 0;
 
 
 #if (NGX_STAT_STUB)
@@ -64,7 +65,7 @@ static ngx_str_t ngx_http_stub_requests_header_html = ngx_string(
 "  cursor:pointer;\n"
 "}\n"
 "</style>\n"
-"<script src=\"//ajax.googleapis.com/ajax/libs/jquery/1.9.1/jquery.min.js\"></script>\n"
+"<script src=\"//ajax.googleapis.com/ajax/libs/jquery/2.1.4/jquery.min.js\"></script>\n"
 "<script>\n"
 
 /*
@@ -97,9 +98,15 @@ SOFTWARE.
 "  $(function() {\n"
 "    $('table').stupidtable();\n"
 "  });\n"
+"\n"
+"  if (history.replaceState) {\n"
+"    // Remove the ?enable=1 or ?disable=1\n"
+"    history.replaceState({}, document.title, document.location.pathname);\n"
+"  }\n"
 "</script>\n"
 "</head>\n"
 "<body>\n"
+"<p><a href=\"?enable=1\">enable</a> | <a href=\"?disable=1\">disable</a></p>\n"
 );
 
 static ngx_str_t ngx_http_stub_requests_middle_html = ngx_string(
@@ -185,7 +192,7 @@ static char *ngx_http_stub_requests_set_shm_size(ngx_conf_t *cf, ngx_command_t *
 
   new_shm_size = ngx_parse_size(&value[1]);
   if (new_shm_size == NGX_ERROR) {
-    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "Invalid memory area size `%V'", &value[1]);
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "Invalid memory area size '%V'", &value[1]);
     return NGX_CONF_ERROR;
   }
 
@@ -232,6 +239,13 @@ static ngx_int_t ngx_http_stub_requests_init_shm_zone(ngx_shm_zone_t *shm_zone, 
   *e = NULL;
 
   shm_zone->data = e;
+
+
+  ngx_http_stub_requests_enabled = ngx_slab_alloc_locked(shpool, sizeof(ngx_atomic_int_t));
+  if (ngx_http_stub_requests_enabled == NULL) {
+    return NGX_ERROR;
+  }
+  *ngx_http_stub_requests_enabled = 0;
 
   return NGX_OK;
 }
@@ -368,8 +382,17 @@ static ngx_chain_t *ngx_http_stub_requests_show(ngx_http_request_t *r, ngx_http_
 
 
 static ngx_int_t ngx_http_stub_requests_show_handler(ngx_http_request_t *r) {
+  ngx_str_t ignore;
+  ngx_chain_t *table;
+
   if (!(r->method & (NGX_HTTP_GET|NGX_HTTP_HEAD))) {
     return NGX_HTTP_NOT_ALLOWED;
+  }
+
+  if (ngx_http_arg(r, (u_char *) "enable", 6, &ignore) == NGX_OK) {
+    *ngx_http_stub_requests_enabled = 1;
+  } else if (ngx_http_arg(r, (u_char *) "disable", 7, &ignore) == NGX_OK) {
+    *ngx_http_stub_requests_enabled = 0;
   }
 
   r->headers_out.status = NGX_HTTP_OK;
@@ -383,17 +406,15 @@ static ngx_int_t ngx_http_stub_requests_show_handler(ngx_http_request_t *r) {
   }
 
   ngx_slab_pool_t *shpool = (ngx_slab_pool_t *)ngx_http_stub_requests_shm_zone->shm.addr;
+  ngx_shmtx_lock(&shpool->mutex);
   ngx_http_stub_requests_entry_t *entries = *((ngx_http_stub_requests_entry_t**)ngx_http_stub_requests_shm_zone->data);
 
-  ngx_shmtx_lock(&shpool->mutex);
-  /* Since our own request also counts we know for sure we have at least one request.
-     So no need to check if entries is NULL. */
-  ngx_chain_t *table = ngx_http_stub_requests_show(r, entries);
-  ngx_shmtx_unlock(&shpool->mutex);
-
-  if (table == NULL) {
-    return NGX_ERROR;
+  if (entries == NULL) {
+    table = NULL;
+  } else {
+    table = ngx_http_stub_requests_show(r, entries);
   }
+  ngx_shmtx_unlock(&shpool->mutex);
 
   ngx_chain_t header;
   header.buf = ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
@@ -405,20 +426,20 @@ static ngx_int_t ngx_http_stub_requests_show_handler(ngx_http_request_t *r) {
 
 #if (NGX_STAT_STUB)
 
-  size_t len = sizeof("Active connections:  <br>\n") + NGX_ATOMIC_T_LEN
+  size_t len = sizeof("<p>Active connections:  <br>\n") + NGX_ATOMIC_T_LEN
     + sizeof("Reading:  Writing:  Waiting:  <br>\n") + 3 * NGX_ATOMIC_T_LEN
-    + sizeof("Per second:  <br>\n") + NGX_ATOMIC_T_LEN;
+    + sizeof("Per second:  <br></p>\n") + NGX_ATOMIC_T_LEN;
 
   ngx_chain_t stats;
   header.next = &stats;
   stats.buf = ngx_create_temp_buf(r->pool, len);
   stats.buf->memory = 1;
 
-  stats.buf->last = ngx_sprintf(stats.buf->pos, "Active connections: %uA <br>\n", *ngx_stat_active);
+  stats.buf->last = ngx_sprintf(stats.buf->pos, "<p>Active connections: %uA <br>\n", *ngx_stat_active);
   stats.buf->last = ngx_sprintf(stats.buf->last, "Reading: %uA Writing: %uA Waiting: %uA <br>\n",
     *ngx_stat_reading, *ngx_stat_writing, *ngx_stat_waiting
   );
-  stats.buf->last = ngx_sprintf(stats.buf->last, "Per second: %uA <br>\n", ngx_http_stub_requests_per_second);
+  stats.buf->last = ngx_sprintf(stats.buf->last, "Per second: %uA <br></p>\n", ngx_http_stub_requests_per_second);
 
   last = &stats;
 
@@ -432,9 +453,13 @@ static ngx_int_t ngx_http_stub_requests_show_handler(ngx_http_request_t *r) {
   middle.buf->last = ngx_http_stub_requests_middle_html.data + ngx_http_stub_requests_middle_html.len;
   middle.buf->memory = 1;
 
-  last = table;
-  while (last->next != NULL) {
-    last = last->next;
+  if (table != NULL) {
+    last = table;
+    while (last->next != NULL) {
+      last = last->next;
+    }
+  } else {
+    last = &middle;
   }
 
   ngx_chain_t footer;
@@ -480,6 +505,10 @@ static void ngx_http_stub_requests_cleanup(void *data) {
 
 
 static ngx_int_t ngx_http_stub_requests_log_handler(ngx_http_request_t *r) {
+  if (*ngx_http_stub_requests_enabled == 0) {
+    return NGX_DECLINED;
+  }
+
   size_t len = sizeof(ngx_http_stub_requests_entry_t) +
     r->connection->addr_text.len +
     r->method_name.len +

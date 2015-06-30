@@ -10,6 +10,7 @@ Dependencies
 ============
 * Sources for nginx 1.x.x, and its dependencies.
 
+* `ngx_http_stub_requests` will load jQuery from "//ajax.googleapis.com/ajax/libs/jquery/2.1.4/jquery.min.js"
 
 Building
 ========
@@ -69,6 +70,9 @@ stub_requests
 :Context: location
 :Description:
   The basic request information will be accessible from the surrounding location.
+
+  The location can not use any parameters as `ngx_http_stub_requests` will use these for it's enable
+  and disable functionality.
 
 stub_requests_shm_size
 ~~~~~~~~~~~~~~~~~~~~
